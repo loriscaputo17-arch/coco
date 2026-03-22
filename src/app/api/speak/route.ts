@@ -1,7 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createHash } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
 
 const VOICES = {
   luca:    "TxGEqnHWrfWFTfGW9XjX",
@@ -10,19 +7,19 @@ const VOICES = {
   giovanni:"zcAOhNBS3c14rBihAFp1",
 } as const;
 
-// Cache dir inside .next (persists during dev server session)
-const CACHE_DIR = join(process.cwd(), ".next", "audio-cache");
-
-function ensureCache() {
-  if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
-}
-
-function getCacheKey(text: string, voiceId: string): string {
-  return createHash("md5").update(text + voiceId).digest("hex");
-}
-
-function getCachePath(key: string): string {
-  return join(CACHE_DIR, `${key}.mp3`);
+function cleanForTTS(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*/g, "")
+    .replace(/#+\s/g, "")
+    .replace(/\s—\s/g, ", ")
+    .replace(/\s-\s/g, ", ")
+    .replace(/\.\.\./g, "…")
+    .replace(/^\d+\.\s/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim()
+    .substring(0, 5000);
 }
 
 export async function POST(req: NextRequest) {
@@ -39,34 +36,7 @@ export async function POST(req: NextRequest) {
       VOICES[voice_name as keyof typeof VOICES] ||
       VOICES.luca;
 
-    // Clean text
-    const clean = text
-      .replace(/\*\*/g, "")
-      .replace(/\*/g, "")
-      .replace(/#+ /g, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/^\d+\.\s/gm, "")
-      .substring(0, 5000);
-
-    // ── Check cache ──────────────────────────────────────────
-    ensureCache();
-    const cacheKey = getCacheKey(clean, selectedVoiceId);
-    const cachePath = getCachePath(cacheKey);
-
-    if (existsSync(cachePath)) {
-      console.log(`[audio-cache] HIT ${cacheKey.slice(0, 8)}`);
-      const cached = readFileSync(cachePath);
-      return new NextResponse(cached, {
-        headers: {
-          "Content-Type": "audio/mpeg",
-          "X-Cache": "HIT",
-          "Cache-Control": "public, max-age=86400",
-        },
-      });
-    }
-
-    // ── Generate via ElevenLabs ──────────────────────────────
-    console.log(`[audio-cache] MISS ${cacheKey.slice(0, 8)} — calling ElevenLabs`);
+    const clean = cleanForTTS(text);
 
     const response = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}`,
@@ -79,14 +49,14 @@ export async function POST(req: NextRequest) {
         },
         body: JSON.stringify({
           text: clean,
-          model_id: "eleven_turbo_v2_5",
+          model_id: "eleven_multilingual_v2",
+          language_code: "it",
           voice_settings: {
-            stability: 0.35,
-            similarity_boost: 0.75,
-            style: 0.45,
+            stability: 0.28,
+            similarity_boost: 0.72,
+            style: 0.62,
             use_speaker_boost: true,
           },
-          language_code: "it",
         }),
       }
     );
@@ -98,21 +68,11 @@ export async function POST(req: NextRequest) {
     }
 
     const audioBuffer = await response.arrayBuffer();
-    const audioBytes = Buffer.from(audioBuffer);
 
-    // ── Save to cache ────────────────────────────────────────
-    try {
-      writeFileSync(cachePath, audioBytes);
-      console.log(`[audio-cache] SAVED ${cacheKey.slice(0, 8)} (${(audioBytes.length / 1024).toFixed(0)}KB)`);
-    } catch (e) {
-      console.warn("[audio-cache] Could not write cache:", e);
-    }
-
-    return new NextResponse(audioBytes, {
+    return new NextResponse(audioBuffer, {
       headers: {
         "Content-Type": "audio/mpeg",
-        "X-Cache": "MISS",
-        "Cache-Control": "public, max-age=86400",
+        "Cache-Control": "no-store",
       },
     });
   } catch (err: any) {
@@ -121,7 +81,6 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// HEAD request to check if ElevenLabs is configured
 export async function HEAD() {
   const hasKey = !!process.env.ELEVENLABS_API_KEY;
   return new NextResponse(null, { status: hasKey ? 200 : 503 });
